@@ -1,0 +1,146 @@
+version: '3.8'
+
+services:
+  # 1. Authoritative PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: cloudledger-postgres
+    environment:
+      POSTGRES_DB: cloudledger
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d cloudledger"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cloudledger-net
+
+  # 2. Redis for Transient Idempotency Locks & Rate Limiting
+  redis:
+    image: redis:7-alpine
+    container_name: cloudledger-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cloudledger-net
+
+  # 3. Apache Kafka (KRaft mode, no Zookeeper required)
+  kafka:
+    image: bashj79/kafka-kraft:latest
+    container_name: cloudledger-kafka
+    environment:
+      KAFKA_ENABLE_KRAFT: "yes"
+      KAFKA_CFG_NODE_ID: 1
+      KAFKA_CFG_PROCESS_ROLES: "broker,controller"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - cloudledger-net
+
+  # 4. Kafka UI for Consumer Lag & Topic Telemetry
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: cloudledger-kafka-ui
+    ports:
+      - "8085:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      - kafka
+    networks:
+      - cloudledger-net
+
+  # 5. CloudLedger Spring Boot Core Platform
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cloudledger-backend
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/cloudledger
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgrespassword
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      JWT_SECRET: 4c6f75644c65646765725365637265744b6579466f724a5754546f6b656e56616c69646174696f6e32303236
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - cloudledger-net
+
+  # 6. CloudLedger React / Nginx Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: cloudledger-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - cloudledger-net
+
+  # 7. Prometheus Metrics Scraper
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: cloudledger-prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - cloudledger-net
+
+  # 8. Grafana Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    container_name: cloudledger-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - cloudledger-net
+
+networks:
+  cloudledger-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
